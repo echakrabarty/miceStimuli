@@ -1,6 +1,6 @@
 ---
-title: "STA_141A_FP"
-author: "eshachakrabarty"
+title: "Steinmetz Mice Predictive Modeling"
+author: "Esha Chakrabarty"
 date: "2024-03-15"
 output: html_document
 ---
@@ -18,7 +18,6 @@ library(class)
 library(randomForest)
 library(ROCR)
 ```
-# Title
 
 ## Abstract
 This reports attempts to predict the response type of a mouse in the Steinmetz et al. (2019) trials. Through exploratory data analysis, predictive modeling, and assessing prediction performance, it is determined that extreme gradient boosting is the best predictive model with 73% accuracy.
@@ -92,6 +91,7 @@ trialInfo <- createEDAframe(session)
 
 ### Data Structure
 The variables in the dataset are listed below:
+
 - `mouse_name`: name of the mouse
 
 - `date`: date of the session
@@ -108,14 +108,14 @@ The variables in the dataset are listed below:
 
 - `brain_area`: area of the brain where each neuron lives
 
-```{r, include = FALSE}
+```{r}
 eda1 = trialInfo %>%
   count(mouse)%>%
   mutate(perc = `n` / sum(`n`)) %>% 
   arrange(perc) %>%
   mutate(labels = scales::percent(perc))
 ```
-```{r, echo=FALSE}
+```{r}
 plot <- ggplot(eda1, aes(x="", y=perc, fill = mouse))+
   geom_col()+
   geom_text(aes(label = labels), position = position_stack(vjust = 0.5))+
@@ -124,6 +124,7 @@ plot <- ggplot(eda1, aes(x="", y=perc, fill = mouse))+
   ylab("Percent")+
   ggtitle("What percent of trials was each mouse part of?")+
   theme(plot.title = element_text(face="bold"))
+plot
 ```
 
 There are 4 different mice across the 18 sessions. Lederberg has participated in the largest number of trials. Thus, further exploration is required to determine if mice that have participated in more trials, are more likely to succeed in the experiment. 
@@ -379,11 +380,17 @@ Based on the data analysis we have some main findings.
 - When charting spike rates in both the most commonly surveyed brain area as well as the total average spike rate, both create a similar shape: during unsuccessful trials the average spike change is less drastic over the trial than the successful trials. 
 - Using the weak correlations we found when comparing the categorical variables, we can include that as session number increases and as trial number decreases, the likelihood of success increases. 
 
-Based on these findings we build a data set with the predictors: - `contrast_difference`: (left contrast - right contrast)
-- Time Bins 20-40: We have shown through our analysis that 
-- session number
-- trial number
-- spike difference: greatest average spike rate - minimum average spike rate
+Based on these findings we build a data set with the predictors: 
+
+- `contrast_difference`: (left contrast - right contrast)
+
+- `average spike rate`: Only for time bins 20-40
+
+- `session number`
+
+- `trial number`
+
+- `spike difference`: greatest average spike rate - minimum average spike rate
 
 ## Section 4: Predictive Modeling
 
@@ -676,3 +683,11 @@ Although ROC had the lowest accuracy, it is the best at avoiding false positives
 ## Section 6: Discussion
 
 Given these outcomes, I would choose the random forest model as the best. Despite the poorest accuracy in this specific test case and seed, this model is much better at discriminating between the classifications. The models performed the best they could with the data that they were trained on. As I mentioned previously in the model selection section, the data set is very imbalanced because it has many more successes than failures. In order to counteract this, future models could implement oversampling the failures so the models have a more holistic and representative data set. Given these shortcomings, the random forest is the best model to select since it is not limited to only one decision tree and is uses bootstrap samples to form multiple trees. Since the predictors, even in the exploratory phase, only had weak correlations, a randomized algorithm is best. 
+
+# Appendix {-}
+
+## Data Reference
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+## Github Repository
+https://github.com/echakrabarty/miceStimuli
