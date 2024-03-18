@@ -1,0 +1,678 @@
+---
+title: "STA_141A_FP"
+author: "eshachakrabarty"
+date: "2024-03-15"
+output: html_document
+---
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 10, fig.height = 6, warning = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggcorrplot)
+library(gridExtra)
+library(xgboost)
+library(caret)
+library(class)
+library(randomForest)
+library(ROCR)
+```
+# Title
+
+## Abstract
+This reports attempts to predict the response type of a mouse in the Steinmetz et al. (2019) trials. Through exploratory data analysis, predictive modeling, and assessing prediction performance, it is determined that extreme gradient boosting is the best predictive model with 73% accuracy.
+
+## Section 1: Introduction
+The experiment in this case provides a mouse with 2 stimuli, one on the left and one on the right. There is a wheel in front of the mouse and the direction in which the wheel is turned, if at all, determines the feedback type. If the left contrast is greater than the right then the wheel turned to the right is a success. Similarly, if the right contrast is greater than the left contrast then the wheel turned to the left is deemed a success. If both the right and left contrast are zero then the wheel should be left still. Finally, when both right contrast and left contrast are equivalent, then the response for success is random. The goal is to build a predictive model to determine whether a trial will be a success or failure. In order to derive the model, the data structure will be explored further. Relationships between success rates and variables will be analyzed and then integrated. Various models will be fitted and the best performing one will be chosen. 
+
+## Section 2: Exploratory Analysis
+```{r}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('/Users/eshachakrabarty/Downloads/STA 141A/miceStimuli/sessions/session',i,'.rds',sep=''))
+}
+spikeTrends <- function(data){
+  spike = matrix(nrow = 5081, ncol = 40)
+  ### total spikes per time bin for each trial
+  index = 1
+  for(i in c(1:18)){
+    for(j in c(1:length(data[[i]]$contrast_left))){
+      spike[index, ]<-colSums(data[[i]]$spks[[j]])/length(data[[i]]$brain_area)
+      index = index+1
+    } 
+  }
+
+  return(spike)
+}
+createEDAframe <- function(data, class="list"){
+  sessionN = c()
+  trial = c()
+  feedback_type = c()
+  contrast_left = c()
+  contrast_right = c()
+  brain_area = c()
+  mouse = c()
+  nNeurons = c()
+  for(i in c(1:18)){
+    for(j in c(1:length(data[[i]]$contrast_left))){
+      sessionN = c(sessionN, i)
+      trial = c(trial, j)
+      mouse = c(mouse, data[[i]]$mouse_name)
+      feedback_type = c(feedback_type, data[[i]]$feedback_type[j])
+      contrast_left = c(contrast_left, data[[i]]$contrast_left[j])
+      contrast_right = c(contrast_right, data[[i]]$contrast_right[j])
+      nNeurons = c(nNeurons, length(data[[i]]$brain_area))
+    
+    }
+  }
+
+  trialInfo <- data.frame(sessionN, trial, mouse, feedback_type,
+                          contrast_left, contrast_right, nNeurons)
+
+  spike <- spikeTrends(data)
+  spikes <- data.frame(spike)
+
+  spikeMins <- apply(spike, 1, FUN = min)
+  spikeMaxs <- apply(spike, 1, FUN = max)
+
+  spikeDiff <- spikeMaxs-spikeMins
+
+
+  trialInfo <- cbind(trialInfo, spikes, spikeDiff)
+
+  contrastDiff = trialInfo$contrast_left - trialInfo$contrast_right
+
+  trialInfo["contrastDiff"] <- contrastDiff
+  return(trialInfo)
+}
+
+trialInfo <- createEDAframe(session)
+```
+
+### Data Structure
+The variables in the dataset are listed below:
+- `mouse_name`: name of the mouse
+
+- `date`: date of the session
+
+- `feedback_type`: type of the feedback, 1 for success and -1 for failure
+
+- `contrast_left`: contrast of the left stimulus
+
+- `contrast_right`: contrast of the right stimulus
+
+- `time`: centers of the time bins for `spks` 
+
+- `spks`: numbers of spikes of neurons in the visual cortex in time bins defined in `time`
+
+- `brain_area`: area of the brain where each neuron lives
+
+```{r, include = FALSE}
+eda1 = trialInfo %>%
+  count(mouse)%>%
+  mutate(perc = `n` / sum(`n`)) %>% 
+  arrange(perc) %>%
+  mutate(labels = scales::percent(perc))
+```
+```{r, echo=FALSE}
+plot <- ggplot(eda1, aes(x="", y=perc, fill = mouse))+
+  geom_col()+
+  geom_text(aes(label = labels), position = position_stack(vjust = 0.5))+
+  coord_polar(theta = "y")+
+  scale_fill_brewer(palette = "PRGn")+
+  ylab("Percent")+
+  ggtitle("What percent of trials was each mouse part of?")+
+  theme(plot.title = element_text(face="bold"))
+```
+
+There are 4 different mice across the 18 sessions. Lederberg has participated in the largest number of trials. Thus, further exploration is required to determine if mice that have participated in more trials, are more likely to succeed in the experiment. 
+
+There are also 18 separate sessions. In order to build a useful model, we want to see if there is a relationship between certain variables and success rate. 
+
+```{r}
+### success rate across sessions
+eda2 <- trialInfo %>%
+  group_by(sessionN) %>%
+  summarise(n = n(), successes = sum(feedback_type==1))%>%
+  mutate(success_rate = successes/n)
+
+plot1 <- ggplot(eda2, aes(x = sessionN, y = success_rate))+
+  geom_col()+
+  xlab("Session")+
+  ylab("Success Rate")+
+  ggtitle("Success Trends")+
+  theme(plot.title = element_text(face="bold"))
+
+### success rate across mice
+eda3 <- trialInfo %>%
+  group_by(mouse) %>%
+  summarise(n = n(), successes = sum(feedback_type==1))%>%
+  mutate(success_rate = successes/n)
+
+
+plot2 <- ggplot(eda3, aes(x = mouse, y = success_rate))+
+  geom_col()+
+  xlab("Mouse")+
+  ylab("Success Rate")
+
+### success rate across contrast difference
+eda4 <- trialInfo %>%
+  group_by(contrastDiff) %>%
+  summarise(n = n(), successes = sum(feedback_type==1))%>%
+  mutate(success_rate = successes/n)
+
+plot3 <- ggplot(eda4, aes(x = contrastDiff, y = success_rate))+
+  geom_col()+
+  xlab("Contrast Difference (L-R)")+
+  ylab("Success Rate")
+
+
+grid.arrange(plot1, plot2, plot3, ncol = 3)
+
+```
+
+There appears to be a slight general increase in success rates as sessions go on. Same with mice. Interestingly, the contrast differences [-1, -0.75, -0.5, 0, 0.5, .75, 1] seem to have a positive parabolic structure where the larger differences have higher success rates than the smaller ones. This could be due to the fact that a higher contrast differences makes it easier for mice to recognize the difference and is therefore more likely to turn the wheel in the correct direction.
+
+```{r}
+### correlation between variables
+eda5 <- trialInfo %>%
+  select(-starts_with("X"))
+
+p1 <- model.matrix(~0+., data = eda5)%>%
+  cor(use="pairwise.complete.obs")%>%
+  ggcorrplot(show.diag = FALSE, type = "lower", lab = TRUE)+
+  ggtitle("Correlation Plot Through \n Quantifying Categorical Variables")+
+  theme(plot.title = element_text(face="bold"))
+
+p1
+
+```
+
+
+In order to determine the correlation between variables we can build a correlation plot. Focusing on the feedback_type argument we see that spike difference (the highest average spike - the lowest average spike rate), and session number seem to have a slight positive correlation with feedback rate. This implies that the greater the spike rate difference and the greater the session number, the greater the likelihood of success is. There also appears to be a weak negative correlation between trial number and feedback type, this implies that as trial number increases, the greater the likelihood of failure. 
+
+```{r}
+### Spikes over time
+spikes <- as.data.frame(spikeTrends(session))
+
+res1_5 <- pivot_longer(spikes, cols = starts_with("V"), names_to="time", values_to = "spikeRate")
+res1_5["time"] <- rep(c(1:40), 5081)
+ggplot(res1_5, aes(time, spikeRate))+
+  geom_bin2d()+
+  xlab("Time")+
+  ylab("Spike Rate")+
+  ggtitle("Spike Rate Over 40 Time Bins")+
+  theme(plot.title = element_text(face="bold"))
+```
+
+
+This plot shows the average spike rate over time. The majority of average percent of spikes appears to hover around 2.5% of recorded neurons for all time bins. It is useful to explore subsets of the total data. Since each trial has the same number of neurons recorded, the variation is lessened. 
+
+
+```{r message=FALSE, warning=FALSE}
+### average spike train grouped by session
+res <- cbind(sessionN = trialInfo$sessionN, spikes)
+res1_5 <- pivot_longer(res, cols = starts_with("V"), names_to="time", values_to = "spikeRate")
+res1_5["time"] <- rep(c(1:40), 5081)
+res1 <- res %>% 
+  group_by(sessionN) %>%
+  summarise(across(.cols = everything(), list(mean)))
+
+res2 <- pivot_longer(res1, cols = starts_with("V"), names_to = "variable", values_to = "spikeRate")
+res2["variable"]<- rep(c(1:40), 18)
+
+
+p2 <- ggplot(res2, aes(variable, spikeRate))+
+  geom_point(alpha = 0.5)+
+  geom_smooth()+
+  facet_wrap(vars(sessionN), ncol = 9)+
+  xlab("Time")+
+  ylab("Spike Rate")+
+  ggtitle("Average Spike Rate Across Sessions")+
+  theme(plot.title = element_text(face="bold"))
+
+### average spike train grouped by mouse
+res <- cbind(mouse = trialInfo$mouse, spikes)
+res1_5 <- pivot_longer(res, cols = starts_with("V"), names_to="time", values_to = "spikeRate")
+res1_5["time"] <- rep(c(1:40), 5081)
+res1 <- res %>% 
+  group_by(mouse) %>%
+  summarise(across(.cols = everything(), list(mean)))
+
+res2 <- pivot_longer(res1, cols = starts_with("V"), names_to = "variable", values_to = "spikeRate")
+res2["variable"]<- rep(c(1:40), 4)
+
+p3 <- ggplot(res2, aes(variable, spikeRate))+
+  geom_point(alpha = 0.5)+
+  geom_smooth()+
+  facet_wrap(vars(mouse))+
+  xlab("Time")+
+  ylab("Spike Rate")+
+  ggtitle("Average Spike Rate Across Mice")+
+  theme(plot.title = element_text(face="bold"))
+
+### average spike rate for success vs failure
+
+res <- cbind(feedback_type = trialInfo$feedback_type, spikes)
+res1 <- res %>% 
+  group_by(feedback_type) %>%
+  summarise(across(.cols = everything(), list(mean)))
+res1_5 <- pivot_longer(res, cols = starts_with("V"), names_to="time", values_to = "spikeRate")
+res1_5["time"] <- rep(c(1:40), 5081)
+
+res2 <- pivot_longer(res1, cols = starts_with("V"), names_to = "variable", values_to = "spikeRate")
+res2["variable"]<- rep(c(1:40), 2)
+
+p4 <- ggplot(res2, aes(variable, spikeRate))+
+  geom_point(alpha = 0.5)+
+  geom_smooth()+
+  facet_wrap(vars(feedback_type))+
+  xlab("Time")+
+  ylab("Spike Rate")+
+  ggtitle("Average Spike Rate Across Feedback")+
+  theme(plot.title = element_text(face="bold"))
+
+grid.arrange(p2, arrangeGrob(p3, p4, ncol = 2), nrow = 2)
+```
+
+It appears as though many of the sessions have different levels of neuron activity. This is most likely due to the fact that many of them recorded different neurons. Some of the sessions also have much larger variation in spike rate than others. 
+
+Interestingly, the larger the contrast difference is, the higher the spike rate peak is. -1, the largest possible contrast difference is also has the highest success rate. There may also be a correlation between the difference of peak avg spike rate in a trial vs starting (or lowest) spike rate. There is a slight positive correlation between feedback rate and the difference between the maximum and minimum spike rate. 
+
+```{r message=FALSE, warning=FALSE}
+allNeurons <- data.frame()
+for(i in c(1:18)){
+  tmp = matrix(0, nrow = length(session[[i]]$brain_area), ncol = 40)
+  for(j in c(1:length(session[[i]]$contrast_left))){
+    tmp = tmp + as.matrix(session[[i]]$spks[[j]])
+  }
+  allNeurons = rbind(allNeurons, tmp)
+}
+sessnum = c()
+brainAreas = c()
+
+for(i in c(1:18)){
+  sessnum = c(sessnum, rep(i, length(session[[i]]$brain_area)))
+  brainAreas = c(brainAreas, session[[i]]$brain_area)
+}
+
+brainInfo <- cbind(sessnum, brainAreas, allNeurons)
+
+brainInfoStacked <- brainInfo %>%
+  group_by(sessnum, brainAreas)%>%
+  summarise(number_cases = n())%>%
+  group_by(sessnum)%>%
+  mutate(total_cases = sum(number_cases),
+         proportion = number_cases/total_cases)
+
+
+
+plot4 <- ggplot(brainInfoStacked, aes(brainAreas, as.factor(sessnum), fill=proportion))+
+  geom_raster()+
+  coord_fixed()+
+  xlab("Brain Area")+
+  ylab("Session")+
+  ggtitle("Recorded Brain Areas in Each Session")+
+  theme(plot.title = element_text(face="bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot4
+```
+
+We can see that the most commonly samples brain area was the "root." In trials 6 and 17 over half of the neurons collected were from the root. This is most likely what the researchers thought will have the most crucial brain area and neuron activity. Therefore, the "root" area of the brain can be explored further to see if there are any new trends that we can determine. 
+
+```{r message=FALSE, warning=FALSE}
+rootNeurons <- data.frame()
+
+for(i in c(1:18)){
+  for(j in c(1:length(session[[i]]$contrast_left))){
+    target <- session[[i]]$spks[[j]][session[[i]]$brain_area == "root", ]
+   totalNum <- dim(target)[1]
+   spikeRate <- apply(target, 2, mean)
+   rootNeurons <- rbind(rootNeurons, spikeRate)
+  }
+}
+
+withRoot <- cbind(sess = trialInfo$sessionN, trial = trialInfo$trial, feedback = trialInfo$feedback_type, rootNeurons)%>%
+  filter(sess != 4, sess != 16)
+
+withRoot_long <- pivot_longer(withRoot, starts_with("X"), names_to = "time", values_to = "spike")
+withRoot_long["time"]<- rep(c(1:40), 182080/40)
+withRoot_long["spike"]<- scale(withRoot_long$spike)
+
+ggplot(withRoot_long, aes(time, spike))+
+  geom_hex(alpha = 0.6)+
+  geom_smooth()+
+  facet_wrap(vars(feedback))+
+  xlab("Time")+
+  ylab("Average Spike Rate Scaled")+
+  ggtitle("Average Neuron Activity in Root Area, Grouped By Feedback Type")+
+  theme(plot.title = element_text(face="bold"))
+```
+
+This plot shows that the rate of average neuron spikes in the root is relatively uniform throughout sessions and trials, indicating no distinct peak throughout the the time bins. However, it can be noted that the variation in the trend line when looking at the successes, is slightly greater than the ones related to the failures. This supports out earlier finding that the spike rate is more volatile during successful trials when compared to unsuccessful ones. 
+
+I want to determine whether all the time bins are useful for a predictive model so I will build a correlation plot between the average spike bins in the "root" area and feedback type. 
+
+```{r}
+
+eda9 <- pivot_wider(withRoot_long, names_from = time, values_from = spike)
+
+corr = eda9 %>%
+  select(c(3:43))%>%
+  cor()
+
+
+ggcorrplot(corr, type = "lower", lab = FALSE)
+
+```
+
+Although this plot indicates very weak to correlation between feedback type and the time bins. We can determine that the later time bins (after around 20), have a higher, although still weak, correlation. 
+
+
+## Section 3: Data Integration
+
+Based on the data analysis we have some main findings. 
+- The greater the absolute value of contrast difference, the greater the likelihood of success
+- The second half of time bins seems to have a higher correlation with the feedback type than the first half. 
+- When charting spike rates in both the most commonly surveyed brain area as well as the total average spike rate, both create a similar shape: during unsuccessful trials the average spike change is less drastic over the trial than the successful trials. 
+- Using the weak correlations we found when comparing the categorical variables, we can include that as session number increases and as trial number decreases, the likelihood of success increases. 
+
+Based on these findings we build a data set with the predictors: - `contrast_difference`: (left contrast - right contrast)
+- Time Bins 20-40: We have shown through our analysis that 
+- session number
+- trial number
+- spike difference: greatest average spike rate - minimum average spike rate
+
+## Section 4: Predictive Modeling
+
+We will choose 3 models for this data: K-nearest neighbors, Random Forest, and Extreme Gradient Boost. 
+
+### KNN Model
+
+#### Rationale:
+This was the first model I chose because there are a large number of data points and it operates under the assumption of non-linear relationships by only relying on euclidean norms. In addition, it tends to perform well for classification problems like this where the outputs are binary. 
+
+#### Choosing K:
+The rule of thumb is that the choice for K is the square root of the number of points in the training data. Since we have approximately 4000 points in our training set, I started with k=63 for the first model. 
+
+### Random Forest
+
+#### Rationale
+I chose a random forest as one of my models because they tend to not over fit data in the way a decision tree would. One of my main concerns with the data was that there are far more successes than failures throughout the sessions. As a result this imbalance is present in the training data as well since it was randomly selected and I did not do any oversampling. A random tree is able to maintain accuracy despite missing or imbalanced data. 
+
+#### Choosing mtry
+The default `mtry` value is the $\sqrt{n}$ similar to the KNN rule of thumb. However, I chose a small `mtry` value because it would help reduce fitting since the data is relatively noisy. I wanted to build a stable model that would work well predictively so I decided to choose a small `mtry` value of 12. 
+
+### Extreme Gradient Boost
+
+#### Rationale
+I chose this model because it uses a single decision tree. It is able to capture a lot of model complexity. In addition, for the large number of samples and small number of features, non linear extreme gradient boosting is an appropriate model. 
+
+#### Choosing weighting and prediction boundary
+One of my main worried going into creating this model was the imbalanced training data. Sincere the model was being trained on a much greater number of successful trials, it would be more likely over predict the successes. Because of this I used the `scale_pos_weight` in order to provide the ratio of negative to positive values in the data. In addition I moved the decision boundary to 0.3 as opposed to the typical 0.5 to account for this discrepancy. 
+
+## Section 5: Prediction Performance on the Test Sets
+```{r}
+loadTestData <- function(path){
+  test=list()
+for(i in 1:2){
+  test[[i]]=readRDS(paste(path,i,'.rds',sep=''))
+}
+  return(test)
+}
+  
+getlabels <- function(data, class="list"){
+  labells = c()
+  for(i in c(1:18)){
+    for(j in c(1:length(data[[i]]$contrast_left))){
+      labells = c(labells, data[[i]]$feedback_type[j])
+    } 
+  }
+  return(labells)
+}
+
+createPrediction <- function(data, class = "list"){
+  sessNum <- c()
+  trialNum <- c()
+  contrastDiff <- c()
+  spikeDiff <- c()
+  for(i in c(1:18)){
+    for(j in c(1:length(data[[i]]$contrast_left))){
+      sessNum = c(sessNum, i)
+      trialNum = c(trialNum, j)
+      contrastDiff = c(contrastDiff, data[[i]]$contrast_left[j]-data[[i]]$contrast_right[j])
+    }
+  }
+  
+  spike = matrix(nrow = 5081, ncol = 40)
+  ### total spikes per time bin for each trial
+  index = 1
+  for(i in c(1:18)){
+    for(j in c(1:length(data[[i]]$contrast_left))){
+      spike[index, ]<-colSums(data[[i]]$spks[[j]])/length(data[[i]]$brain_area)
+      index = index+1
+    } 
+    
+  }
+
+  spikeMins <- apply(spike, 1, FUN = min)
+  spikeMaxs <- apply(spike, 1, FUN = max)
+  spikeDiff <- spikeMaxs-spikeMins
+  
+  predictors <- cbind(sessNum, trialNum, contrastDiff, spikeDiff, spike[,20:40])
+  return(predictors)
+}
+getTrainIndeces <- function(df, prop){
+  len <- dim(df)[1]
+  n <- prop*len
+  indeces <- sample(1:len, n, replace = FALSE)
+  return(indeces)
+}
+
+predictors <- createPrediction(session)
+trialLabel <- getlabels(session)
+
+
+set.seed(420)
+## subset 80% of data for training
+trainIndex <- getTrainIndeces(trialInfo, 0.8)
+
+train_df <- predictors[trainIndex, ]
+test_df <- predictors[-trainIndex, ]
+
+trialLabel[trialLabel == -1] <- 0
+
+train_label <- trialLabel[trainIndex]
+test_label <- trialLabel[-trainIndex]
+
+#KNN
+model1predict <- function(trainData, testData, trainLabs, testLabs){
+  predictions <- knn(trainData, testData, trainLabs, k=45)
+  confusion <- table(predictions, testLabs)
+  accuracy = sum(diag(confusion))/sum(confusion)
+  return(list(predictions = predictions, confusion = confusion, accuracy = accuracy))
+}
+
+# Random Forest
+model2predict <- function(trainData, testData, trainLabs, testLabs){
+  model2 <- randomForest(as.factor(trainLabs)~., data = trainData, proximity = TRUE, mtry = 12)
+  set.seed(420)
+  prediction <- predict(model2, testData)
+  confusion <- table(prediction, testLabs)
+  accuracy <- sum(diag(confusion))/sum(confusion)
+  return(list(predictions = prediction, confusion = confusion, accuracy = accuracy))
+}
+#EXtremet Gradient Boost
+model3predict <- function(trainData, testData, trainLabs, testLabs){
+  model3 <- xgboost(data = trainData, label = trainLabs, nrounds = 20, objective = "binary:logistic", scale_pos_weight = 0.7, verbose = FALSE)
+  pred <- predict(model3, testData)
+  predictions <- as.numeric(pred>0.3)
+  confusion <- table(predictions, testLabs)
+  accuracy <- mean(predictions == testLabs)
+  return(list(predictions = predictions, confusion = confusion, accuracy = accuracy))
+}
+
+
+```
+```{r}
+test <- loadTestData("/Users/eshachakrabarty/Downloads/STA 141A/miceStimuli/test/test")
+
+
+```
+```{r}
+### test
+  sessNum <- c()
+  trialNum <- c()
+  contrastDiff <- c()
+  spikeDiff <- c()
+for(j in c(1:length(test[[1]]$contrast_left))){
+    sessNum = c(sessNum, 1)
+    trialNum = c(trialNum, j)
+    contrastDiff = c(contrastDiff, test[[1]]$contrast_left[j]-test[[1]]$contrast_right[j])
+}
+  
+for(j in c(1:length(test[[2]]$contrast_left))){
+    sessNum = c(sessNum, 18)
+    trialNum = c(trialNum, j)
+    contrastDiff = c(contrastDiff, test[[1]]$contrast_left[j]-test[[1]]$contrast_right[j])
+}
+
+  
+  spike = matrix(nrow = length(contrastDiff), ncol = 40)
+  ### total spikes per time bin for each trial
+  index = 1
+    for(j in c(1:length(test[[1]]$contrast_left))){
+      spike[index, ]<-colSums(test[[1]]$spks[[j]])/length(test[[1]]$brain_area)
+      index = index+1
+    } 
+    for(j in c(1:length(test[[2]]$contrast_left))){
+      spike[index, ]<-colSums(test[[2]]$spks[[j]])/length(test[[2]]$brain_area)
+      index = index+1
+    }
+
+  spikeMins <- apply(spike, 1, FUN = min)
+  spikeMaxs <- apply(spike, 1, FUN = max)
+  spikeDiff <- spikeMaxs-spikeMins
+  
+  testpredictors <- cbind(sessNum, trialNum, contrastDiff, spikeDiff, spike[,20:40])
+
+```
+```{r}
+
+labells = c()
+for(j in c(1:length(test[[1]]$contrast_left))){
+  labells = c(labells, test[[1]]$feedback_type[j])
+  } 
+for(j in c(1:length(test[[2]]$contrast_left))){
+  labells = c(labells, test[[2]]$feedback_type[j])
+}
+testLabels <- labells
+testLabels[testLabels == -1]<- 0
+```
+
+
+#### Model 1: KNN, k=45
+
+```{r}
+model1 <- model1predict(trainData = predictors, testData = testpredictors, trainLabs = trialLabel, testLabs = testLabels)
+
+conf <- confusionMatrix(as.factor(model1$predictions), as.factor(testLabels))
+plt <- as.data.frame(conf$table)
+
+ggplot(plt, aes(Reference, Prediction, fill = Freq))+
+  geom_tile()+geom_text(aes(label=Freq))+
+  scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("-1","1")) +
+        scale_y_discrete(labels=c("-1","1"))+
+  ggtitle("KNN Confusion Matrix, Accuracy = 72.5%")+
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+#### Model 2: Random Forest
+
+```{r}
+set.seed(420)
+model2 <- model2predict(trainData = predictors, testData = testpredictors, trainLabs = trialLabel, testLabs = testLabels)
+
+
+conf <- confusionMatrix(as.factor(model2$predictions), as.factor(testLabels))
+plt <- as.data.frame(conf$table)
+
+ggplot(plt, aes(Reference, Prediction, fill = Freq))+
+  geom_tile()+geom_text(aes(label=Freq))+
+  scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("-1","1")) +
+        scale_y_discrete(labels=c("-1","1"))+
+  ggtitle("Random Forest Confusion Matrix, Accuracy = 71%")+
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+#### Model 3: Extreme Gradient Boosting
+
+```{r message=FALSE, warning=FALSE}
+model3 <- model3predict(trainData = predictors, testData = testpredictors, trainLabs = trialLabel, testLabs = testLabels)
+
+
+conf <- confusionMatrix(as.factor(model3$predictions), as.factor(testLabels))
+plt <- as.data.frame(conf$table)
+
+ggplot(plt, aes(Reference, Prediction, fill = Freq))+
+  geom_tile()+geom_text(aes(label=Freq))+
+  scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("-1","1")) +
+        scale_y_discrete(labels=c("-1","1"))+
+  ggtitle("XGBoost Confusion Matrix, Accuracy = 71.5%")+
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+### Overall:
+
+All these models had one glaring weakness and it was the false success predictions. The models would over predict the number of successes. For example, in model 1, the success prediction accuracy was 100% but the failure prediction accuracy was 0%.  It effectively placed all the points into the same category. 
+
+```{r}
+### model1 
+pr = prediction(as.numeric(model1$predictions), testLabels)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+
+### model2
+
+pr = prediction(as.numeric(model2$predictions), testLabels)
+prf2 <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc2 <- performance(pr, measure = "auc")
+auc2 <- auc2@y.values[[1]]
+
+### model3
+pr = prediction(model3$predictions, testLabels)
+prf3 <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc3 <- performance(pr, measure = "auc")
+auc3 <- auc3@y.values[[1]]
+
+### bias
+pred0 = model3$predictions * 0 + 1
+pr = prediction(pred0, testLabels)
+prf0 <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc0 <- performance(pr, measure = "auc")
+auc0 <- auc0@y.values[[1]]
+
+plot(prf3, col="red", main = "ROC curve")#xgb
+plot(prf2, add = TRUE, col = "purple")#rf
+plot(prf, add = TRUE, col = "blue")#knn
+plot(prf0, add=TRUE, col = "green")
+```
+
+Although ROC had the lowest accuracy, it is the best at avoiding false positives. The Random Forest and KNN performed similarly so it is difficult to see in the ROC curve. By calculating the Area Under the Curve or (AUC) we can determine that the extreme gradient boosting model has the poorest performance, due to its slightly lower AUC value. The K-nearest neighbors model appears to be on the bias which is not promising since that means that the model is just as good as guessing positive or negative. 
+
+
+## Section 6: Discussion
+
+Given these outcomes, I would choose the random forest model as the best. Despite the poorest accuracy in this specific test case and seed, this model is much better at discriminating between the classifications. The models performed the best they could with the data that they were trained on. As I mentioned previously in the model selection section, the data set is very imbalanced because it has many more successes than failures. In order to counteract this, future models could implement oversampling the failures so the models have a more holistic and representative data set. Given these shortcomings, the random forest is the best model to select since it is not limited to only one decision tree and is uses bootstrap samples to form multiple trees. Since the predictors, even in the exploratory phase, only had weak correlations, a randomized algorithm is best. 
